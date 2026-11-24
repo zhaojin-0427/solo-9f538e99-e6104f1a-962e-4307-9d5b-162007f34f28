@@ -4,15 +4,17 @@ Design guarantees (see README for the full rationale):
 
 * A submission runs inside one transaction. On any failure nothing is
   committed, so operators can still query the previous committed result.
-* Re-submitting a band only reads *that scene's* source masks and only
-  rewrites coverage rows inside *that scene's* grid extent.
-* Queries never read per-scene masks: they read the committed ``coverage``
-  table only, at most one row per rectangle cell.
+* Re-submitting a band only reads *that scene's* two source masks and only
+  rewrites coverage rows inside *that scene's* grid extent whose validity
+  bits for this scene actually change. Other scenes' contributions live in
+  the per-cell counters and are preserved without being read.
+* Queries never read per-scene masks or scene-id lists: they read the
+  committed ``coverage_v2`` table only, at most one fixed-size row per
+  rectangle cell, so the read volume grows with the number of cells only.
 """
 
 from __future__ import annotations
 
-import json
 import sqlite3
 from datetime import date as date_type
 
@@ -35,11 +37,18 @@ def _flatten(mask: list[list[int]]) -> bytes:
     return bytes(v for row in mask for v in row)
 
 
+def _bit(mask: bytes | None, index: int) -> bool:
+    """Validity bit of a scene's own mask at a flat cell index."""
+    return mask is not None and mask[index] == 1
+
+
 def submit_mask(conn: sqlite3.Connection, sub: MaskSubmission) -> dict:
     """Insert/correct one band mask and recompute this scene's coverage.
 
-    Only coverage cells inside the submitted scene's extent are touched, and
-    only the submitted scene's contribution to those cells changes.
+    Only coverage cells inside the submitted scene's extent are considered,
+    and among them only the cells where this scene's own validity bits
+    (red / nir / both-valid) actually change are written. Other scenes'
+    contributions are kept in the per-cell counters and are never rewritten.
     """
     date_str = sub.date.isoformat()
     flat = _flatten(sub.mask)
@@ -76,17 +85,19 @@ def submit_mask(conn: sqlite3.Connection, sub: MaskSubmission) -> dict:
             f"{row['width']}x{row['height']}; a scene's grid position and size are fixed"
         )
 
-    # 2. Read this scene's own current mask for the *other* band. No masks of
-    #    any other scene are read on the correction path.
+    # 2. Read this scene's own current masks: the submitted band's old mask
+    #    (to diff against the new one) and the other band's mask (its
+    #    contribution at each cell is unchanged but participates in the
+    #    same-scene both-valid bit). No masks of any other scene are read.
+    own_rows = conn.execute(
+        "SELECT band, mask FROM band_masks "
+        "WHERE date = ? AND scene_id = ? AND band IN ('red', 'nir')",
+        (date_str, sub.scene_id),
+    ).fetchall()
+    own_masks = {r["band"]: r["mask"] for r in own_rows}
+    old_own: bytes | None = own_masks.get(sub.band)
     other_band = "nir" if sub.band == "red" else "red"
-    other = conn.execute(
-        "SELECT mask FROM band_masks WHERE date = ? AND scene_id = ? AND band = ?",
-        (date_str, sub.scene_id, other_band),
-    ).fetchone()
-    other_by_index = (
-        {i for i, v in enumerate(other["mask"]) if v} if other is not None else set()
-    )
-    new_by_index = {i for i, v in enumerate(flat) if v}
+    other: bytes | None = own_masks.get(other_band)
 
     # 3. Upsert the source mask for the submitted band.
     conn.execute(
@@ -96,14 +107,13 @@ def submit_mask(conn: sqlite3.Connection, sub: MaskSubmission) -> dict:
         (date_str, sub.scene_id, sub.band, flat),
     )
 
-    # 4. Recompute coverage for every cell in this scene's extent. Existing
-    #    coverage rows are loaded in one indexed range scan; other scenes'
-    #    contributions are preserved in their scene-id lists.
+    # 4. Load the per-cell counters inside this scene's extent in one indexed
+    #    range scan. Rows are fixed-size counters; scene ids are not stored.
     ox, oy, w, h = sub.origin_x, sub.origin_y, sub.width, sub.height
     existing: dict[tuple[int, int], sqlite3.Row] = {
         (r["x"], r["y"]): r
         for r in conn.execute(
-            "SELECT x, y, red_scenes, nir_scenes FROM coverage "
+            "SELECT x, y, red_cnt, nir_cnt, both_cnt FROM coverage_v2 "
             "WHERE date = ? AND x BETWEEN ? AND ? AND y BETWEEN ? AND ?",
             (date_str, ox, ox + w - 1, oy, oy + h - 1),
         )
@@ -114,52 +124,51 @@ def submit_mask(conn: sqlite3.Connection, sub: MaskSubmission) -> dict:
         for ix in range(w):
             idx = iy * w + ix
             x, y = ox + ix, oy + iy
-            row = existing.get((x, y))
-            red_scenes = (
-                set(json.loads(row["red_scenes"])) if row is not None else set()
-            )
-            nir_scenes = (
-                set(json.loads(row["nir_scenes"])) if row is not None else set()
-            )
 
-            # Drop this scene's previous contribution, then apply the new one.
-            red_scenes.discard(sub.scene_id)
-            nir_scenes.discard(sub.scene_id)
+            # This scene's own validity bits before and after the correction.
             if sub.band == "red":
-                if idx in new_by_index:
-                    red_scenes.add(sub.scene_id)
-                if idx in other_by_index:
-                    nir_scenes.add(sub.scene_id)
+                old_red = _bit(old_own, idx)
+                new_red = flat[idx] == 1
+                old_nir = new_nir = _bit(other, idx)
             else:
-                if idx in new_by_index:
-                    nir_scenes.add(sub.scene_id)
-                if idx in other_by_index:
-                    red_scenes.add(sub.scene_id)
+                old_nir = _bit(old_own, idx)
+                new_nir = flat[idx] == 1
+                old_red = new_red = _bit(other, idx)
+            old_both = old_red and old_nir
+            new_both = new_red and new_nir
 
-            if not red_scenes and not nir_scenes:
-                # No scene contributes anything here anymore.
-                conn.execute(
-                    "DELETE FROM coverage WHERE date = ? AND x = ? AND y = ?",
-                    (date_str, x, y),
-                )
-                touched += 1
+            # Correction only changes cells where this scene's validity
+            # bits actually move; identical re-submissions write nothing.
+            if (old_red, old_nir, old_both) == (new_red, new_nir, new_both):
                 continue
 
-            conn.execute(
-                "INSERT INTO coverage (date, x, y, red_scenes, nir_scenes) "
-                "VALUES (?, ?, ?, ?, ?) "
-                "ON CONFLICT (date, x, y) DO UPDATE SET "
-                "red_scenes = excluded.red_scenes, "
-                "nir_scenes = excluded.nir_scenes, "
-                "updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')",
-                (
-                    date_str,
-                    x,
-                    y,
-                    json.dumps(sorted(red_scenes), separators=(",", ":")),
-                    json.dumps(sorted(nir_scenes), separators=(",", ":")),
-                ),
-            )
+            d_red = int(new_red) - int(old_red)
+            d_nir = int(new_nir) - int(old_nir)
+            d_both = int(new_both) - int(old_both)
+
+            saved = existing.get((x, y))
+            red_cnt = (saved["red_cnt"] if saved is not None else 0) + d_red
+            nir_cnt = (saved["nir_cnt"] if saved is not None else 0) + d_nir
+            both_cnt = (saved["both_cnt"] if saved is not None else 0) + d_both
+
+            if red_cnt == 0 and nir_cnt == 0 and both_cnt == 0:
+                # No scene contributes anything here anymore.
+                conn.execute(
+                    "DELETE FROM coverage_v2 WHERE date = ? AND x = ? AND y = ?",
+                    (date_str, x, y),
+                )
+            else:
+                conn.execute(
+                    "INSERT INTO coverage_v2 "
+                    "(date, x, y, red_cnt, nir_cnt, both_cnt) "
+                    "VALUES (?, ?, ?, ?, ?, ?) "
+                    "ON CONFLICT (date, x, y) DO UPDATE SET "
+                    "red_cnt = excluded.red_cnt, "
+                    "nir_cnt = excluded.nir_cnt, "
+                    "both_cnt = excluded.both_cnt, "
+                    "updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')",
+                    (date_str, x, y, red_cnt, nir_cnt, both_cnt),
+                )
             touched += 1
 
     return {
@@ -175,15 +184,19 @@ def submit_mask(conn: sqlite3.Connection, sub: MaskSubmission) -> dict:
     }
 
 
-def _classify(red: set[str], nir: set[str]) -> str | None:
-    """Return the gap category, or None when the cell is complete."""
-    if red & nir:
+def _classify(red_cnt: int, nir_cnt: int, both_cnt: int) -> str | None:
+    """Return the gap category, or None when the cell is complete.
+
+    Complete means at least one scene's own red and NIR are both valid at
+    this cell, i.e. ``both_cnt > 0``.
+    """
+    if both_cnt > 0:
         return None
-    if red and nir:
+    if red_cnt > 0 and nir_cnt > 0:
         return GAP_DIFFERENT_SCENES
-    if red:
+    if red_cnt > 0:
         return GAP_RED_ONLY
-    if nir:
+    if nir_cnt > 0:
         return GAP_NIR_ONLY
     return GAP_BOTH_MISSING
 
@@ -199,20 +212,17 @@ def query_gaps(
     """Find gap cells in a rectangle and merge same-category runs per row.
 
     A single indexed range read returns at most ``width * height`` coverage
-    rows; masks are never read here.
+    rows, each a fixed-size counter tuple. Masks and scene-id lists are
+    never read here.
     """
     date_str = query_date.isoformat()
     rows = conn.execute(
-        "SELECT x, y, red_scenes, nir_scenes FROM coverage "
+        "SELECT x, y, red_cnt, nir_cnt, both_cnt FROM coverage_v2 "
         "WHERE date = ? AND x BETWEEN ? AND ? AND y BETWEEN ? AND ?",
         (date_str, origin_x, origin_x + width - 1, origin_y, origin_y + height - 1),
     ).fetchall()
-    by_cell: dict[tuple[int, int], tuple[set[str], set[str]]] = {
-        (r["x"], r["y"]): (
-            set(json.loads(r["red_scenes"])),
-            set(json.loads(r["nir_scenes"])),
-        )
-        for r in rows
+    by_cell: dict[tuple[int, int], tuple[int, int, int]] = {
+        (r["x"], r["y"]): (r["red_cnt"], r["nir_cnt"], r["both_cnt"]) for r in rows
     }
 
     gaps: list[GapRun] = []
@@ -247,8 +257,8 @@ def query_gaps(
 
         for ix in range(width):
             x = origin_x + ix
-            red, nir = by_cell.get((x, y), (set(), set()))
-            category = _classify(red, nir)
+            red_cnt, nir_cnt, both_cnt = by_cell.get((x, y), (0, 0, 0))
+            category = _classify(red_cnt, nir_cnt, both_cnt)
             if category is None:
                 _flush(x - 1)
                 complete += 1
